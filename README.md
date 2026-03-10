@@ -156,10 +156,15 @@ Every request-response pair is stored here regardless of whether a match was fou
 
 Click any row to see the full injected request and raw response side-by-side. Export all results to JSON with **Export JSON**.
 
+Send to repeater/ intruder for further testing.
+
+<img width="2128" height="1262" alt="image" src="https://github.com/user-attachments/assets/0a526d8f-d9e0-4d02-9ab1-01bb57a1739b" />
+
 ---
 
 ### Config Tab
-<img width="3416" height="1922" alt="image" src="https://github.com/user-attachments/assets/2061a2aa-444b-4081-aa59-e493d6879399" />
+<!--<img width="3416" height="1922" alt="image" src="https://github.com/user-attachments/assets/2061a2aa-444b-4081-aa59-e493d6879399" />-->
+<img width="3314" height="1718" alt="image" src="https://github.com/user-attachments/assets/decb853d-6098-4b80-a1ee-eb22d83dc665" />
 
 | Setting | Description |
 |---|---|
@@ -251,7 +256,7 @@ Prompts are fetched from **[Awesome GPT Super Prompting](https://github.com/Cybe
 <img width="1150" height="1146" alt="image" src="https://github.com/user-attachments/assets/21ba512d-fc80-4f09-9c33-d64e59046fcb" />
 
 ## 🛡️ Detection Patterns (defaults)
-
+<img width="1426" height="804" alt="image" src="https://github.com/user-attachments/assets/840644c9-9841-400a-9b7e-f46f1773146b" />
 <img width="1098" height="1310" alt="image" src="https://github.com/user-attachments/assets/47d03fb9-b582-4594-9d81-654dce2d29ef" />
 
 The extension searches response bodies for these patterns to classify findings and creates issue if enabled in config:
