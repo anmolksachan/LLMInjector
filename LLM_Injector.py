@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 # Coded with ❤ by Anmol K Sachan @FR13ND0x7f
-LLM Prompt Injection Tester - Burp Suite Extension  v1.0
+LLM Prompt Injection Tester - Burp Suite Extension  v2.0
 Target: Burp Suite 2026.x  (Jython 2.7)
 Prompts: github.com/CyberAlbSecOP/Awesome_GPT_Super_Prompting
 
@@ -26,8 +26,8 @@ from javax.swing import (
     JPanel, JTabbedPane, JButton, JTextArea, JScrollPane, JLabel, JTextField,
     JCheckBox, JTable, JProgressBar, JSplitPane, JFileChooser,
     JOptionPane, JSpinner, SpinnerNumberModel, JSeparator,
-    JMenuItem, BoxLayout, Box, JPasswordField, SwingUtilities,
-    BorderFactory, ListSelectionModel
+    JMenuItem, JPopupMenu, JComboBox, BoxLayout, Box, JPasswordField,
+    SwingUtilities, BorderFactory, ListSelectionModel
 )
 from javax.swing.table import DefaultTableModel
 from javax.swing.border import EmptyBorder, TitledBorder
@@ -41,8 +41,8 @@ import json, re, time, threading, traceback, copy
 
 # ---- Constants ---------------------------------------------------------------
 
-EXT_NAME    = "LLM Injector by Anmol K Sachan (@FR13ND0x7f)"
-EXT_VERSION = "1.0.0"
+EXT_NAME    = "LLM Injector"
+EXT_VERSION = "3.0.0"
 REPO_OWNER  = "CyberAlbSecOP"
 REPO_NAME   = "Awesome_GPT_Super_Prompting"
 GITHUB_API  = "https://api.github.com/repos/{}/{}/contents/".format(REPO_OWNER, REPO_NAME)
@@ -56,7 +56,7 @@ REPO_FOLDERS = [
 ]
 
 REPO_URL     = "https://github.com/CyberAlbSecOP/Awesome_GPT_Super_Prompting"
-AUTHOR_CREDIT = "Coded with ❤ by Anmol K Sachan @FR13ND0x7f"
+AUTHOR_CREDIT = "Coded with LOVE by Anmol K Sachan @FR13ND0x7f"
 
 # Injection marker - same concept as Burp Intruder
 MARKER = u"\xa7"   # section sign § — must be unicode for Jython string.find()
@@ -103,6 +103,23 @@ SEV_COLORS = {
     "Info":     Color(60,  140, 220),
 }
 
+# Mapping from internal severity labels → Burp API severity strings
+# Burp only accepts: "High", "Medium", "Low", "Information", "False positive"
+BURP_SEVERITY_MAP = {
+    "Critical":    "High",
+    "High":        "High",
+    "Medium":      "Medium",
+    "Low":         "Low",
+    "Info":        "Information",
+    "Information": "Information",
+    "Tested":      "Information",
+}
+
+def burp_severity(sev):
+    """Convert internal severity string to a value Burp's addScanIssue accepts."""
+    return BURP_SEVERITY_MAP.get(str(sev), "Information")
+
+
 C_BG     = Color(22,  24,  30)
 C_PANEL  = Color(32,  35,  46)
 C_INPUT  = Color(42,  46,  60)
@@ -126,7 +143,9 @@ class Prompt(object):
 
 class ScanResult(object):
     def __init__(self, url, method, severity, issue_type,
-                 prompt_name, response_snippet, full_request, full_response):
+                 prompt_name, response_snippet, full_request, full_response,
+                 http_service=None, request_bytes=None, response_bytes=None,
+                 http_rr=None):
         self.url              = url
         self.method           = method
         self.severity         = severity
@@ -135,6 +154,10 @@ class ScanResult(object):
         self.response_snippet = response_snippet
         self.full_request     = full_request
         self.full_response    = full_response
+        self.http_service     = http_service    # IHttpService
+        self.request_bytes    = request_bytes   # byte[] of injected request
+        self.response_bytes   = response_bytes  # byte[] of raw response
+        self.http_rr          = http_rr         # IHttpRequestResponse from makeHttpRequest
         self.timestamp        = time.strftime("%H:%M:%S")
 
 
@@ -598,6 +621,38 @@ class ScanEngine(object):
                 fixed.append(h)
         return helpers.buildHttpMessage(fixed, new_body_bytes)
 
+    # -- Burp Issue creation ---------------------------------------------------
+
+    def _create_burp_issue(self, http_service, url, http_rr,
+                            prompt, hits, severity, label):
+        """Auto-create a Burp Scanner issue when create_issue_on_match is enabled."""
+        try:
+            match_details = u"; ".join(
+                u"pattern='{}' matched='{}'".format(h[0], h[1][:80])
+                for h in hits)
+            detail = (
+                u"<b>LLM Prompt Injection Succeeded</b><br><br>"
+                u"<b>Injection point:</b> {}<br>"
+                u"<b>Prompt:</b> {} (category: {})<br>"
+                u"<b>Detection matches:</b> {}<br><br>"
+                u"<i>Reported by LLM Injector v{} &mdash; Anmol K Sachan (@FR13ND0x7f)</i>"
+            ).format(label, prompt.name, prompt.category,
+                     match_details, EXT_VERSION)
+
+            issue = LLMInjectionIssue(
+                http_service  = http_service,
+                url           = url,
+                http_messages = [http_rr],
+                name          = u"LLM Prompt Injection [{}]".format(prompt.category),
+                detail        = detail,
+                severity      = burp_severity(severity),
+            )
+            self.callbacks.addScanIssue(issue)
+            self.log(u"  [Issue] Auto-created {} issue: {}".format(
+                severity, prompt.name))
+        except Exception as ex:
+            self.log(u"  [Issue] Creation failed: " + traceback.format_exc())
+
     # -- Scoring ---------------------------------------------------------------
 
     def _score(self, body):
@@ -728,6 +783,10 @@ class ScanEngine(object):
                             response_snippet=resp_body[:400].replace("\n", " "),
                             full_request=helpers.bytesToString(new_req),
                             full_response=resp_str,
+                            http_service=http_service,
+                            request_bytes=new_req,
+                            response_bytes=resp_bytes,
+                            http_rr=resp_obj,
                         )
                         results.append(r)
                         if self.on_result:
@@ -735,6 +794,11 @@ class ScanEngine(object):
                         if hits:
                             self.log("  MATCH [{}] {} -> {}".format(
                                 severity, prompt.name, lbl))
+                            # Auto-create Burp issue if enabled
+                            if self.config.get("create_issue_on_match", False):
+                                self._create_burp_issue(
+                                    http_service, req_info.getUrl(),
+                                    resp_obj, prompt, hits, severity, lbl)
                         else:
                             self.log("  tested (no match): {}".format(prompt.name))
 
@@ -910,8 +974,7 @@ class PromptsTab(JPanel):
         name_row.add(self.f_name)
 
         cat_opts = ["manual", "jailbreak", "leak", "super", "ultra", "security"]
-        from javax.swing import JComboBox as JCB
-        self.combo_cat = JCB(cat_opts)
+        self.combo_cat = JComboBox(cat_opts)
         self.combo_cat.setBackground(C_INPUT)
         self.combo_cat.setForeground(C_TEXT)
         self.combo_cat.setFont(Font("Monospaced", Font.PLAIN, 12))
@@ -1236,7 +1299,7 @@ class ScannerTab(JPanel):
             color=C_MUTED, size=11)
         self.req_status.setBorder(EmptyBorder(4, 6, 4, 6))
         credit = dark_label(
-            "Coded with ❤ by Anmol K Sachan @FR13ND0x7f  ",
+            "Coded with LOVE by Anmol K Sachan @FR13ND0x7f  ",
             color=C_MUTED, size=10)
         status_bar.add(self.req_status, BorderLayout.CENTER)
         status_bar.add(credit, BorderLayout.EAST)
@@ -1520,6 +1583,21 @@ class ScannerTab(JPanel):
 # ---- Results Tab -------------------------------------------------------------
 
 class ResultsTab(JPanel):
+    """
+    Every injected request/response is shown here, match or not.
+
+    Toolbar buttons:
+      Send to Repeater  -- loads injected request into a new Repeater tab
+      Send to Intruder  -- loads injected request into Intruder
+      Export JSON       -- saves all results to disk
+
+    Right-click context menu on any row:
+      Send to Repeater
+      Send to Intruder
+      Copy URL
+      Create Burp Issue (manual, for any row)
+    """
+
     def __init__(self, state):
         super(ResultsTab, self).__init__(BorderLayout())
         self.state   = state
@@ -1527,44 +1605,62 @@ class ResultsTab(JPanel):
         self.setBackground(C_BG)
         self._build()
 
+    # =========================================================================
+
     def _build(self):
+        # == TOOLBAR ===========================================================
         tb = JPanel(FlowLayout(FlowLayout.LEFT, 8, 8))
         tb.setBackground(C_PANEL)
         tb.setBorder(BorderFactory.createMatteBorder(0, 0, 1, 0, C_BORDER))
 
-        self.btn_clear  = dark_button("  Clear Results")
-        self.btn_export = dark_button("  Export JSON", C_ACCENT, Color.BLACK)
-        self.lbl_count  = dark_label("  0 findings", color=C_MUTED)
+        self.btn_clear    = dark_button(u"  Clear Results")
+        self.btn_export   = dark_button(u"  Export JSON",      C_ACCENT,           Color.BLACK)
+        self.btn_repeater = dark_button(u"  Send to Repeater", Color(50, 100, 200), C_TEXT)
+        self.btn_intruder = dark_button(u"  Send to Intruder", Color(120, 60, 180), C_TEXT)
 
-        credit_lbl = dark_label(
-            "    Coded with ❤ by Anmol K Sachan  @FR13ND0x7f",
+        self.btn_repeater.setToolTipText(
+            u"Send selected injected request to Burp Repeater")
+        self.btn_intruder.setToolTipText(
+            u"Send selected injected request to Burp Intruder")
+        self.btn_export.setToolTipText(
+            u"Export all results to a JSON file")
+
+        self.lbl_count  = dark_label(u"  0 findings", color=C_MUTED)
+        credit_lbl      = dark_label(
+            u"    Coded with LOVE by Anmol K Sachan  @FR13ND0x7f",
             color=C_MUTED, size=11)
 
-        for w in [self.btn_clear, self.btn_export, self.lbl_count, credit_lbl]:
+        for w in [self.btn_clear, self.btn_export,
+                  self.btn_repeater, self.btn_intruder,
+                  self.lbl_count, credit_lbl]:
             tb.add(w)
         self.add(tb, BorderLayout.NORTH)
 
-        cols = ["Time", "Severity", "Method", "URL", "Injection Type", "Prompt Used"]
+        # == TABLE =============================================================
+        cols = [u"Time", u"Severity", u"Method", u"URL",
+                u"Injection Type", u"Prompt Used"]
         self.model = DefaultTableModel(cols, 0)
         self.table = JTable(self.model)
         style_table(self.table)
         self.table.setAutoCreateRowSorter(True)
         self.table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION)
-        for i, w in enumerate([65, 75, 60, 310, 190, 230]):
+        for i, w in enumerate([65, 75, 60, 310, 210, 210]):
             self.table.getColumnModel().getColumn(i).setPreferredWidth(w)
 
+        # == DETAIL PANES ======================================================
         self.req_area  = dark_area(editable=False)
         self.resp_area = dark_area(editable=False)
 
-        req_panel = section_panel("Request")
+        req_panel = section_panel(u"Injected Request")
         req_panel.setLayout(BorderLayout())
         req_panel.add(scroll(self.req_area, hbar=True), BorderLayout.CENTER)
 
-        resp_panel = section_panel("Response")
+        resp_panel = section_panel(u"Response")
         resp_panel.setLayout(BorderLayout())
         resp_panel.add(scroll(self.resp_area, hbar=True), BorderLayout.CENTER)
 
-        detail_split = JSplitPane(JSplitPane.HORIZONTAL_SPLIT, req_panel, resp_panel)
+        detail_split = JSplitPane(JSplitPane.HORIZONTAL_SPLIT,
+                                  req_panel, resp_panel)
         detail_split.setDividerLocation(520)
         detail_split.setDividerSize(5)
         detail_split.setBackground(C_BG)
@@ -1576,72 +1672,272 @@ class ResultsTab(JPanel):
         main_split.setBackground(C_BG)
         self.add(main_split, BorderLayout.CENTER)
 
+        # == WIRE EVENTS =======================================================
         class Act(ActionListener):
             def __init__(self, fn): self.fn = fn
             def actionPerformed(self, e): self.fn()
 
         self.btn_clear.addActionListener(Act(self._on_clear))
         self.btn_export.addActionListener(Act(self._on_export))
+        self.btn_repeater.addActionListener(Act(self._on_send_repeater))
+        self.btn_intruder.addActionListener(Act(self._on_send_intruder))
 
-        class RowSel(MouseAdapter):
+        class RowListener(MouseAdapter):
             def __init__(self, tab): self.tab = tab
-            def mouseClicked(self, e):
-                row = self.tab.table.getSelectedRow()
-                if row < 0: return
-                idx = self.tab.table.convertRowIndexToModel(row)
-                if 0 <= idx < len(self.tab.results):
-                    r = self.tab.results[idx]
-                    self.tab.req_area.setText(r.full_request)
-                    self.tab.req_area.setCaretPosition(0)
-                    self.tab.resp_area.setText(r.full_response)
-                    self.tab.resp_area.setCaretPosition(0)
-        self.table.addMouseListener(RowSel(self))
+
+            def mouseReleased(self, e):
+                self.tab._update_detail_for_row()
+                if e.isPopupTrigger():
+                    self.tab._show_popup(e)
+
+            def mousePressed(self, e):
+                # Select row under cursor on right-press (Windows/Linux)
+                if e.isPopupTrigger():
+                    row = self.tab.table.rowAtPoint(e.getPoint())
+                    if row >= 0:
+                        self.tab.table.setRowSelectionInterval(row, row)
+                    self.tab._show_popup(e)
+
+        self.table.addMouseListener(RowListener(self))
+
+    # =========================================================================
+    # Helpers
+    # =========================================================================
+
+    def _selected_result(self):
+        row = self.table.getSelectedRow()
+        if row < 0:
+            return None
+        idx = self.table.convertRowIndexToModel(row)
+        if 0 <= idx < len(self.results):
+            return self.results[idx]
+        return None
+
+    def _update_detail_for_row(self):
+        r = self._selected_result()
+        if r is None:
+            return
+        self.req_area.setText(r.full_request or u"")
+        self.req_area.setCaretPosition(0)
+        self.resp_area.setText(r.full_response or u"")
+        self.resp_area.setCaretPosition(0)
+
+    # =========================================================================
+    # Right-click popup
+    # =========================================================================
+
+    def _show_popup(self, e):
+        if self._selected_result() is None:
+            return
+
+        popup = JPopupMenu()
+        popup.setBackground(C_PANEL)
+
+        def _mi(label, fn, bold=False):
+            item = JMenuItem(label)
+            item.setBackground(C_INPUT)
+            item.setForeground(C_TEXT)
+            item.setFont(Font(u"Dialog", Font.BOLD if bold else Font.PLAIN, 12))
+            class _A(ActionListener):
+                def actionPerformed(self_, ev): fn()
+            item.addActionListener(_A())
+            return item
+
+        popup.add(_mi(u"  ▶  Send to Repeater", self._on_send_repeater, bold=True))
+        popup.add(_mi(u"  ▶  Send to Intruder", self._on_send_intruder, bold=True))
+        popup.addSeparator()
+        popup.add(_mi(u"  ⧅  Copy URL",                   self._on_copy_url))
+        popup.add(_mi(u"  ⚠  Create Burp Issue (manual)", self._on_create_issue_manual))
+
+        popup.show(self.table, e.getX(), e.getY())
+
+    # =========================================================================
+    # Send to Repeater
+    # =========================================================================
+
+    def _on_send_repeater(self):
+        r = self._selected_result()
+        if r is None:
+            JOptionPane.showMessageDialog(self,
+                u"Select a result row first.", u"Nothing Selected",
+                JOptionPane.WARNING_MESSAGE)
+            return
+        if r.http_service is None or r.request_bytes is None:
+            JOptionPane.showMessageDialog(self,
+                u"HTTP data not available.\nRe-run the scan to populate it.",
+                u"No Data", JOptionPane.ERROR_MESSAGE)
+            return
+        try:
+            svc      = r.http_service
+            host     = svc.getHost()
+            port     = svc.getPort()
+            protocol = svc.getProtocol()
+            is_https = protocol.lower() == u"https"
+            tab_name = u"LLM: {}".format(r.prompt_name[:45])
+            self.state.callbacks.sendToRepeater(
+                host, port, is_https, r.request_bytes, tab_name)
+            self.state.log(u"[Repeater] Sent: " + r.url)
+        except Exception as ex:
+            JOptionPane.showMessageDialog(self,
+                u"Send to Repeater failed:\n" + str(ex),
+                u"Error", JOptionPane.ERROR_MESSAGE)
+            self.state.log(u"[Repeater] Error: " + traceback.format_exc())
+
+    # =========================================================================
+    # Send to Intruder
+    # =========================================================================
+
+    def _on_send_intruder(self):
+        r = self._selected_result()
+        if r is None:
+            JOptionPane.showMessageDialog(self,
+                u"Select a result row first.", u"Nothing Selected",
+                JOptionPane.WARNING_MESSAGE)
+            return
+        if r.http_service is None or r.request_bytes is None:
+            JOptionPane.showMessageDialog(self,
+                u"HTTP data not available.\nRe-run the scan to populate it.",
+                u"No Data", JOptionPane.ERROR_MESSAGE)
+            return
+        try:
+            svc      = r.http_service
+            host     = svc.getHost()
+            port     = svc.getPort()
+            protocol = svc.getProtocol()
+            is_https = protocol.lower() == u"https"
+            self.state.callbacks.sendToIntruder(
+                host, port, is_https, r.request_bytes)
+            self.state.log(u"[Intruder] Sent: " + r.url)
+        except Exception as ex:
+            JOptionPane.showMessageDialog(self,
+                u"Send to Intruder failed:\n" + str(ex),
+                u"Error", JOptionPane.ERROR_MESSAGE)
+            self.state.log(u"[Intruder] Error: " + traceback.format_exc())
+
+    # =========================================================================
+    # Copy URL
+    # =========================================================================
+
+    def _on_copy_url(self):
+        r = self._selected_result()
+        if r is None:
+            return
+        try:
+            from java.awt import Toolkit
+            from java.awt.datatransfer import StringSelection
+            sel = StringSelection(r.url)
+            Toolkit.getDefaultToolkit().getSystemClipboard().setContents(sel, None)
+        except Exception as ex:
+            self.state.log(u"[CopyURL] " + str(ex))
+
+    # =========================================================================
+    # Manually create a Burp Scanner issue for the selected row
+    # =========================================================================
+
+    def _on_create_issue_manual(self):
+        r = self._selected_result()
+        if r is None:
+            JOptionPane.showMessageDialog(self,
+                u"Select a result row first.", u"Nothing Selected",
+                JOptionPane.WARNING_MESSAGE)
+            return
+        if r.http_service is None or r.http_rr is None:
+            JOptionPane.showMessageDialog(self,
+                u"HTTP request/response objects are not available for this result.\n"
+                u"Re-run the scan to populate them.",
+                u"No Data", JOptionPane.ERROR_MESSAGE)
+            return
+        try:
+            helpers  = self.state.callbacks.getHelpers()
+            req_info = helpers.analyzeRequest(r.http_service, r.request_bytes)
+            detail   = (
+                u"<b>LLM Prompt Injection Finding</b> (manually escalated)<br><br>"
+                u"<b>Prompt:</b> {}<br>"
+                u"<b>Injection:</b> {}<br>"
+                u"<b>Severity:</b> {}<br>"
+                u"<b>Response snippet:</b> <pre>{}</pre>"
+                u"<br><i>Reported by LLM Injector v{} — Anmol K Sachan (@FR13ND0x7f)</i>"
+            ).format(
+                r.prompt_name, r.issue_type, r.severity,
+                r.response_snippet[:300], EXT_VERSION)
+            issue = LLMInjectionIssue(
+                http_service  = r.http_service,
+                url           = req_info.getUrl(),
+                http_messages = [r.http_rr],
+                name          = u"LLM Prompt Injection",
+                detail        = detail,
+                severity      = burp_severity(r.severity),
+            )
+            self.state.callbacks.addScanIssue(issue)
+            JOptionPane.showMessageDialog(self,
+                u"Issue added to Burp Scanner.", u"Issue Created",
+                JOptionPane.INFORMATION_MESSAGE)
+            self.state.log(u"[Issue] Manual issue created for: " + r.url)
+        except Exception as ex:
+            JOptionPane.showMessageDialog(self,
+                u"Issue creation failed:\n" + str(ex),
+                u"Error", JOptionPane.ERROR_MESSAGE)
+            self.state.log(u"[Issue] Error: " + traceback.format_exc())
+
+    # =========================================================================
+    # Add result (called from scan thread via state.results_tab.add_result)
+    # =========================================================================
 
     def add_result(self, r):
         self.results.append(r)
         def _do():
-            self.model.addRow([r.timestamp, r.severity, r.method,
-                               r.url, r.issue_type, r.prompt_name])
-            idx = self.model.getRowCount() - 1
-            self.table.setRowSelectionInterval(idx, idx)
+            self.model.addRow([
+                r.timestamp, r.severity, r.method,
+                r.url, r.issue_type, r.prompt_name,
+            ])
+            last = self.model.getRowCount() - 1
+            self.table.setRowSelectionInterval(last, last)
+            self.table.scrollRectToVisible(
+                self.table.getCellRect(last, 0, True))
             n = len(self.results)
-            self.lbl_count.setText("  {} finding{}".format(n, "s" if n != 1 else ""))
+            self.lbl_count.setText(
+                u"  {} finding{}".format(n, u"s" if n != 1 else u""))
         _edt(_do)
-        self.state.log("[{}] {} - {}".format(r.severity, r.url, r.issue_type))
+        self.state.log(u"[{}] {} | {}".format(r.severity, r.url, r.issue_type))
+
+    # =========================================================================
+    # Clear / Export
+    # =========================================================================
 
     def _on_clear(self):
         self.results = []
         self.model.setRowCount(0)
-        self.req_area.setText("")
-        self.resp_area.setText("")
-        self.lbl_count.setText("  0 findings")
+        self.req_area.setText(u"")
+        self.resp_area.setText(u"")
+        self.lbl_count.setText(u"  0 findings")
 
     def _on_export(self):
         import java.io
         chooser = JFileChooser()
-        chooser.setSelectedFile(
-            java.io.File("llm_results_{}.json".format(time.strftime("%Y%m%d_%H%M%S"))))
+        chooser.setSelectedFile(java.io.File(
+            u"llm_results_{}.json".format(time.strftime(u"%Y%m%d_%H%M%S"))))
         if chooser.showSaveDialog(self) != JFileChooser.APPROVE_OPTION:
             return
         path = str(chooser.getSelectedFile().getAbsolutePath())
         try:
             data = [{
-                "time":    r.timestamp,
-                "severity": r.severity,
-                "url":      r.url,
-                "method":   r.method,
-                "type":     r.issue_type,
-                "prompt":   r.prompt_name,
-                "snippet":  r.response_snippet,
+                u"time":     r.timestamp,
+                u"severity": r.severity,
+                u"url":      r.url,
+                u"method":   r.method,
+                u"type":     r.issue_type,
+                u"prompt":   r.prompt_name,
+                u"snippet":  r.response_snippet,
             } for r in self.results]
             with open(path, "w") as fh:
-                json.dump(data, fh, indent=2)
+                json.dump(data, fh, indent=2, ensure_ascii=False)
             JOptionPane.showMessageDialog(self,
-                "Exported {} results to:\n{}".format(len(self.results), path),
-                "Export OK", JOptionPane.INFORMATION_MESSAGE)
-        except Exception as e:
+                u"Exported {} results to:\n{}".format(len(self.results), path),
+                u"Export OK", JOptionPane.INFORMATION_MESSAGE)
+        except Exception as ex:
             JOptionPane.showMessageDialog(self,
-                "Export failed: " + str(e), "Error", JOptionPane.ERROR_MESSAGE)
+                u"Export failed: " + str(ex), u"Error",
+                JOptionPane.ERROR_MESSAGE)
 
 
 # ---- Config Tab --------------------------------------------------------------
@@ -1710,27 +2006,42 @@ class ConfigTab(JPanel):
         outer.add(Box.createVerticalStrut(10))
 
         # Scan settings
-        sc = section_panel("Scan Settings")
+        sc = section_panel(u"Scan Settings")
         sc.setLayout(GridBagLayout())
 
         self.sp_delay = JSpinner(SpinnerNumberModel(
-            int(self.state.config.get("delay_ms", 400)), 0, 30000, 50))
+            int(self.state.config.get(u"delay_ms", 400)), 0, 30000, 50))
         self.sp_delay.setBackground(C_INPUT)
         self.sp_delay.setPreferredSize(Dimension(100, 26))
 
         self.sp_repeat = JSpinner(SpinnerNumberModel(
-            int(self.state.config.get("repeat_count", 1)), 1, 100, 1))
+            int(self.state.config.get(u"repeat_count", 1)), 1, 100, 1))
         self.sp_repeat.setBackground(C_INPUT)
         self.sp_repeat.setPreferredSize(Dimension(80, 26))
 
-        self.chk_force = JCheckBox("Force scan all endpoints (bypass LLM detection)")
+        self.chk_force = JCheckBox(
+            u"Force scan all endpoints (bypass LLM endpoint detection)")
         self.chk_force.setBackground(C_PANEL)
         self.chk_force.setForeground(C_TEXT)
-        self.chk_force.setSelected(self.state.config.get("scan_all", False))
+        self.chk_force.setFont(Font(u"Dialog", Font.PLAIN, 12))
+        self.chk_force.setSelected(self.state.config.get(u"scan_all", False))
 
-        self._row("Delay between requests (ms):", self.sp_delay,  sc, 0)
-        self._row("Repeat each prompt (times):",  self.sp_repeat, sc, 1)
-        self._row("Force scan:",                  self.chk_force, sc, 2)
+        self.chk_create_issue = JCheckBox(
+            u"Auto-create Burp Scanner issue on every [MATCH] result")
+        self.chk_create_issue.setBackground(C_PANEL)
+        self.chk_create_issue.setForeground(C_ACCENT)
+        self.chk_create_issue.setFont(Font(u"Dialog", Font.BOLD, 12))
+        self.chk_create_issue.setToolTipText(
+            u"When ON: every MATCH result is automatically raised as a Burp Scanner"
+            u" issue with the full injected request and response attached.\n"
+            u"You can also create issues manually from the Results tab right-click menu.")
+        self.chk_create_issue.setSelected(
+            self.state.config.get(u"create_issue_on_match", False))
+
+        self._row(u"Delay between requests (ms):", self.sp_delay,         sc, 0)
+        self._row(u"Repeat each prompt (times):",  self.sp_repeat,        sc, 1)
+        self._row(u"Force scan:",                  self.chk_force,        sc, 2)
+        self._row(u"Create issue on match:",        self.chk_create_issue, sc, 3)
         outer.add(sc)
         outer.add(Box.createVerticalStrut(10))
 
@@ -1787,13 +2098,14 @@ class ConfigTab(JPanel):
         endpoints = [l.strip() for l in self.ta_endpoints.getText().splitlines() if l.strip()]
         fields    = [l.strip() for l in self.ta_fields.getText().splitlines()    if l.strip()]
         self.state.config.update({
-            "github_token":      str(self.f_token.getText()),
-            "delay_ms":          int(self.sp_delay.getValue()),
-            "repeat_count":      int(self.sp_repeat.getValue()),
-            "scan_all":          self.chk_force.isSelected(),
-            "success_patterns":  patterns,
-            "endpoint_patterns": endpoints,
-            "body_fields":       fields,
+            u"github_token":          str(self.f_token.getText()),
+            u"delay_ms":              int(self.sp_delay.getValue()),
+            u"repeat_count":          int(self.sp_repeat.getValue()),
+            u"scan_all":              self.chk_force.isSelected(),
+            u"create_issue_on_match": self.chk_create_issue.isSelected(),
+            u"success_patterns":      patterns,
+            u"endpoint_patterns":     endpoints,
+            u"body_fields":           fields,
         })
         self.state.save_settings()
         JOptionPane.showMessageDialog(self,
@@ -1809,6 +2121,7 @@ class ConfigTab(JPanel):
             self.sp_delay.setValue(400)
             self.sp_repeat.setValue(1)
             self.chk_force.setSelected(False)
+            self.chk_create_issue.setSelected(False)
 
 
 # ---- Extension State ---------------------------------------------------------
@@ -1821,13 +2134,14 @@ class ExtensionState(object):
         self.pending_request = None
         self.results_tab     = None
         self.config          = {
-            "github_token":      "",
-            "delay_ms":          400,
-            "repeat_count":      1,
-            "scan_all":          False,
-            "success_patterns":  list(DEFAULT_SUCCESS_PATTERNS),
-            "endpoint_patterns": list(DEFAULT_ENDPOINT_PATTERNS),
-            "body_fields":       list(DEFAULT_BODY_FIELDS),
+            "github_token":           "",
+            "delay_ms":               400,
+            "repeat_count":           1,
+            "scan_all":               False,
+            "create_issue_on_match":  False,
+            "success_patterns":       list(DEFAULT_SUCCESS_PATTERNS),
+            "endpoint_patterns":      list(DEFAULT_ENDPOINT_PATTERNS),
+            "body_fields":            list(DEFAULT_BODY_FIELDS),
         }
 
     def log(self, msg):
@@ -1891,6 +2205,38 @@ class ExtensionState(object):
             self.log("Loaded {} prompts from local storage.".format(len(loaded)))
         except Exception as e:
             self.log("load_prompts error: " + str(e))
+
+
+# ---- LLM Injection Scan Issue -----------------------------------------------
+
+class LLMInjectionIssue(IScanIssue):
+    """IScanIssue implementation for LLM prompt injection findings."""
+
+    def __init__(self, http_service, url, http_messages, name, detail, severity):
+        self._http_service  = http_service
+        self._url           = url
+        self._http_messages = http_messages
+        self._name          = name
+        self._detail        = detail
+        self._severity      = severity
+
+    def getUrl(self):               return self._url
+    def getIssueName(self):         return self._name
+    def getIssueType(self):         return 134217728   # 0x08000000 custom extension issue
+    def getSeverity(self):          return self._severity
+    def getConfidence(self):        return u"Firm"
+    def getIssueBackground(self):
+        return (u"Prompt injection allows an attacker to override or bypass "
+                u"instructions given to an LLM, potentially leaking sensitive "
+                u"data, producing harmful output, or hijacking model behaviour.")
+    def getRemediationBackground(self):
+        return (u"Validate and sanitise all user-supplied input before "
+                u"including it in prompts. Use system-prompt isolation, "
+                u"output filtering, and rate-limiting on LLM endpoints.")
+    def getIssueDetail(self):       return self._detail
+    def getRemediationDetail(self): return None
+    def getHttpMessages(self):      return self._http_messages
+    def getHttpService(self):       return self._http_service
 
 
 # ---- Passive Scanner ---------------------------------------------------------
@@ -2042,11 +2388,11 @@ class BurpExtender(IBurpExtender, ITab, IExtensionStateListener):
             credit_bar.setBackground(Color(18, 20, 26))
             credit_bar.setBorder(BorderFactory.createMatteBorder(1, 0, 0, 0, C_BORDER))
 
-            heart_lbl = JLabel("[LOVE]")
+            heart_lbl = JLabel("❤")
             heart_lbl.setForeground(Color(220, 60, 60))
             heart_lbl.setFont(Font("Dialog", Font.BOLD, 13))
 
-            credit_lbl = JLabel("Coded with  ")
+            credit_lbl = JLabel("Coded with LOVE ")
             credit_lbl.setForeground(C_MUTED)
             credit_lbl.setFont(Font("Dialog", Font.PLAIN, 11))
 
