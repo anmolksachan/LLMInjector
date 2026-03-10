@@ -32,6 +32,14 @@ Unlike generic fuzzers, LLM Injector understands JSON structure — it never cor
 
 ---
 
+## 🎥 Demo
+
+<p align="center">
+  <a href="https://anmolksachan.github.io/LLMPenTestHub/LLM_injector.mp4">
+    <img src="https://img.shields.io/badge/▶-Watch%20Demo-red?style=for-the-badge">
+  </a>
+</p>
+
 ## ✨ Features
 
 | Feature | Description |
