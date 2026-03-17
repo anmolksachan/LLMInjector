@@ -4,6 +4,7 @@
 LLM Prompt Injection Tester  v4.0.0
 Target: Burp Suite 2026.x  (Jython 2.7)
 Prompts: github.com/CyberAlbSecOP/Awesome_GPT_Super_Prompting
+Prompts: github.com/elder-plinius/CL4R1T4S
 
 NEW IN v4.0.0:
   - Response Diffing        : baseline vs injected, colour-coded diff panel
@@ -31,26 +32,51 @@ from burp import (IBurpExtender, ITab, IScannerCheck, IContextMenuFactory,
 from javax.swing import (
     JPanel, JTabbedPane, JButton, JTextArea, JScrollPane, JLabel, JTextField,
     JCheckBox, JTable, JProgressBar, JSplitPane, JFileChooser,
-    JOptionPane, JSpinner, SpinnerNumberModel, JSeparator,
+    JOptionPane, JSpinner, SpinnerNumberModel,
     JMenuItem, JPopupMenu, JComboBox, BoxLayout, Box, JPasswordField,
-    SwingUtilities, BorderFactory, ListSelectionModel, JTextPane,
-    SwingConstants
+    SwingUtilities, BorderFactory, ListSelectionModel
 )
-from javax.swing.table import DefaultTableModel, DefaultTableCellRenderer
+from javax.swing.table import DefaultTableModel
 from javax.swing.border import EmptyBorder, TitledBorder
-from javax.swing.text import SimpleAttributeSet, StyleConstants
 from java.awt import (Color, Font, Dimension, BorderLayout, FlowLayout,
                       GridBagLayout, GridBagConstraints, Insets, Cursor)
 from java.awt.event import ActionListener, MouseAdapter
-from java.lang import Runnable, StringBuilder, Thread as JThread
+from java.lang import Runnable, StringBuilder
 from java.net import URL
 from java.io import BufferedReader, InputStreamReader
 import json, re, time, threading, traceback, copy, difflib, hashlib
 
+# ---- Safe unicode helper ------------------------------------------------------
+# Jython 2.7: str(exception) raises UnicodeEncodeError when the exception
+# message contains non-ASCII chars (e.g. '…' U+2026 from GitHub API bodies).
+# Always use _u(e) instead of _u(e) when logging exceptions.
+
+def _u(obj):
+    """Coerce any object to a unicode string without raising."""
+    try:
+        if isinstance(obj, unicode):
+            return obj
+        return unicode(obj)
+    except Exception:
+        try:
+            return unicode(repr(obj))
+        except Exception:
+            return u"<unrepresentable>"
+
+
+def _safe_hash(s):
+    """MD5 hex digest of a string — safe for Java Strings and all unicode."""
+    try:
+        if not isinstance(s, unicode):
+            s = unicode(s)
+        return hashlib.md5(s.encode(u"utf-8", u"replace")).hexdigest()
+    except Exception:
+        return hashlib.md5(repr(s).encode(u"ascii", u"replace")).hexdigest()
+
 # ---- Constants -----------------------------------------------------------------
 
 EXT_NAME      = u"LLM Injector"
-EXT_VERSION   = u"4.0.0"
+EXT_VERSION   = u"4.1.0"
 REPO_OWNER    = u"CyberAlbSecOP"
 REPO_NAME     = u"Awesome_GPT_Super_Prompting"
 GITHUB_API    = u"https://api.github.com/repos/{}/{}/contents/".format(
@@ -64,6 +90,23 @@ REPO_FOLDERS = [
     (u"My Super Prompts",  u"super"),
     (u"Ultra Prompts",     u"ultra"),
     (u"Prompt Security",   u"security"),
+]
+
+# ---- CL4R1T4S — Leaked System Prompts repo (elder-plinius) -------------------
+CL4R1TAS_OWNER  = u"elder-plinius"
+CL4R1TAS_REPO   = u"CL4R1T4S"
+CL4R1TAS_API    = u"https://api.github.com/repos/{}/{}/contents/".format(
+                      CL4R1TAS_OWNER, CL4R1TAS_REPO)
+CL4R1TAS_URL    = u"https://github.com/elder-plinius/CL4R1T4S"
+
+# Known top-level vendor folders — used as fallback if API listing fails.
+# Each maps to the "sysprompt" category with the vendor name as source tag.
+CL4R1TAS_VENDORS = [
+    u"ANTHROPIC", u"BOLT", u"BRAVE", u"CLINE", u"CLUELY",
+    u"CURSOR", u"DEVIN", u"DIA", u"FACTORY", u"GOOGLE",
+    u"HUME", u"LOVABLE", u"MANUS", u"META", u"MINIMAX",
+    u"MISTRAL", u"MOONSHOT", u"MULTION", u"OPENAI", u"PERPLEXITY",
+    u"REPLIT", u"SAMEDEV", u"VERCEL V0", u"WINDSURF", u"XAI",
 ]
 
 MARKER = u"\xa7"   # section sign §
@@ -238,8 +281,8 @@ class GitHubFetcher(object):
         conn.setRequestProperty(u"User-Agent", u"BurpLLMInjector/4.0")
         if self.token and self.token.strip():
             conn.setRequestProperty(u"Authorization", u"token " + self.token.strip())
-        conn.setConnectTimeout(15000)
-        conn.setReadTimeout(30000)
+        conn.setConnectTimeout(8000)
+        conn.setReadTimeout(12000)
         code = conn.getResponseCode()
         if code == 403:
             raise Exception(u"GitHub rate limit. Add a token in Config tab.")
@@ -256,7 +299,7 @@ class GitHubFetcher(object):
         try:
             return raw.encode(u"utf-8").decode(u"utf-8")
         except Exception:
-            return raw.encode(u"ascii", u"replace").decode(u"ascii")
+            return raw.encode(u"latin-1", u"replace").decode(u"latin-1")
 
     def list_folder(self, folder_name):
         import urllib
@@ -286,7 +329,7 @@ class GitHubFetcher(object):
                         try:
                             content = raw_content.encode(u"utf-8").decode(u"utf-8")
                         except Exception:
-                            content = raw_content.encode(u"ascii", u"replace").decode(u"ascii")
+                            content = raw_content.encode(u"latin-1", u"replace").decode(u"latin-1")
                         extracted = self._extract_prompts(content)
                         for i, text in enumerate(extracted):
                             suffix = u"" if len(extracted) == 1 else u" #{:02d}".format(i + 1)
@@ -299,9 +342,9 @@ class GitHubFetcher(object):
                         if progress_cb:
                             progress_cb(len(prompts), folder, f[u"name"])
                     except Exception as e:
-                        self.log(u"[WARN] {}: {}".format(f[u"name"], str(e)))
+                        self.log(u"[WARN] {}: {}".format(f[u"name"], _u(e)))
             except Exception as e:
-                self.log(u"[ERROR] {}: {}".format(folder, str(e)))
+                self.log(u"[ERROR] {}: {}".format(folder, _u(e)))
         return prompts
 
     def _extract_prompts(self, md):
@@ -319,6 +362,219 @@ class GitHubFetcher(object):
         cleaned = re.sub(r"[*_]{1,2}([^*_]+)[*_]{1,2}", r"\1", cleaned)
         cleaned = re.sub(r"\n{3,}", u"\n\n", cleaned).strip()
         return [cleaned] if len(cleaned) > 30 else [md.strip()]
+
+
+# ---- CL4R1T4S Fetcher ---------------------------------------------------------
+
+class CL4R1TASFetcher(object):
+    """
+    Fetches leaked system prompts from elder-plinius/CL4R1T4S.
+
+    Repo layout:
+        VENDOR/                 — top-level folder per AI product
+            file.md / file.txt  — system prompt (whole file = one prompt)
+            SUBFOLDER/          — optional one level of nesting (e.g. OPENAI/ChatGPT)
+                file.md / file.txt
+
+    Key differences from GitHubFetcher:
+      - Walks two levels of directory nesting
+      - Accepts both .md AND .txt files
+      - Does NOT extract code blocks — the full file IS the prompt
+      - Category is always "sysprompt"; source is "cl4r1t4s/<VENDOR>"
+    """
+
+    SUPPORTED_EXT = (u".md", u".txt")
+
+    def __init__(self, token=None, log_fn=None):
+        self.token = token
+        self.log   = log_fn or (lambda m: None)
+
+    # ---- HTTP helper identical to GitHubFetcher._get -------------------------
+
+    def _get(self, url_str):
+        url  = URL(url_str)
+        conn = url.openConnection()
+        conn.setRequestProperty(u"Accept",     u"application/vnd.github.v3+json")
+        conn.setRequestProperty(u"User-Agent", u"BurpLLMInjector/4.0-CL4R1T4S")
+        if self.token and self.token.strip():
+            conn.setRequestProperty(u"Authorization", u"token " + self.token.strip())
+        conn.setConnectTimeout(8000)
+        conn.setReadTimeout(12000)
+        code = conn.getResponseCode()
+        if code == 403:
+            raise Exception(u"GitHub rate limit (CL4R1T4S). Add a token in Config tab.")
+        if code != 200:
+            raise Exception(u"HTTP {} for {}".format(code, url_str))
+        br   = BufferedReader(InputStreamReader(conn.getInputStream(), u"UTF-8"))
+        sb   = StringBuilder()
+        line = br.readLine()
+        while line is not None:
+            sb.append(line).append(u"\n")
+            line = br.readLine()
+        br.close()
+        raw = sb.toString()
+        try:
+            return raw.encode(u"utf-8").decode(u"utf-8")
+        except Exception:
+            return raw.encode(u"latin-1", u"replace").decode(u"latin-1")
+
+    # ---- Directory lister ----------------------------------------------------
+
+    def _list_dir(self, api_path):
+        """
+        List contents at api_path.
+        Returns (files, subdirs) where each is a list of GitHub content dicts.
+        """
+        raw   = self._get(api_path)
+        items = json.loads(raw)
+        files   = []
+        subdirs = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            t = it.get(u"type", u"")
+            n = it.get(u"name", u"")
+            if t == u"file":
+                low = n.lower()
+                if any(low.endswith(ext) for ext in CL4R1TASFetcher.SUPPORTED_EXT):
+                    files.append(it)
+            elif t == u"dir":
+                subdirs.append(it)
+        return files, subdirs
+
+    # ---- Content downloader --------------------------------------------------
+
+    def _download(self, download_url):
+        raw = self._get(download_url)
+        try:
+            return raw.encode(u"utf-8").decode(u"utf-8")
+        except Exception:
+            return raw.encode(u"latin-1", u"replace").decode(u"latin-1")
+
+    # ---- Per-file prompt factory ---------------------------------------------
+
+    def _make_prompt(self, item, vendor, content):
+        """Return a Prompt object from a single file."""
+        fname = item.get(u"name", u"unknown")
+        # Strip extension for the prompt name
+        stem  = fname
+        for ext in CL4R1TASFetcher.SUPPORTED_EXT:
+            if stem.lower().endswith(ext):
+                stem = stem[:-len(ext)]
+                break
+        name = u"{}/{}".format(vendor, stem)
+        return Prompt(
+            name     = name,
+            content  = content.strip(),
+            category = u"sysprompt",
+            source   = u"cl4r1t4s/{}".format(vendor),
+        )
+
+    # ---- Main entry point ----------------------------------------------------
+
+    def fetch_all_prompts(self, progress_cb=None, stop_flag=None):
+        """
+        Walk the CL4R1T4S repo and return a list of Prompt objects.
+        Strategy:
+          1. List root — identify vendor dirs dynamically (fallback to
+             CL4R1TAS_VENDORS if API call fails).
+          2. For each vendor dir, list files + one level of subdirs.
+          3. Download each eligible file and create a Prompt.
+        """
+        prompts = []
+
+        # Step 1 — get vendor directory list
+        try:
+            self.log(u"[CL4R1T4S] Listing root folders…")
+            raw       = self._get(CL4R1TAS_API)
+            root_items = json.loads(raw)
+            vendors   = [
+                it[u"name"] for it in root_items
+                if isinstance(it, dict) and it.get(u"type") == u"dir"
+                and it.get(u"name", u"") not in (u"", u".")
+                and not it.get(u"name", u"").startswith(u".")
+            ]
+            self.log(u"[CL4R1T4S] {} vendor folders found".format(len(vendors)))
+        except Exception as e:
+            self.log(u"[CL4R1T4S] Root listing failed ({}), using static list".format(
+                _u(e)))
+            vendors = list(CL4R1TAS_VENDORS)
+
+        # Step 2 — walk each vendor
+        for vendor in vendors:
+            if stop_flag and stop_flag[0]:
+                break
+            self.log(u"[CL4R1T4S] Processing: {}".format(vendor))
+            try:
+                import urllib as _ul
+                enc_vendor = _ul.quote(vendor.encode(u"utf-8"), safe=b"")
+                vendor_api = CL4R1TAS_API + enc_vendor
+                files, subdirs = self._list_dir(vendor_api)
+
+                # Direct files in vendor folder
+                for item in files:
+                    if stop_flag and stop_flag[0]:
+                        break
+                    dl_url = item.get(u"download_url", u"")
+                    if not dl_url:
+                        continue
+                    try:
+                        content = self._download(dl_url)
+                        time.sleep(0.15)   # be polite to GitHub API
+                        if len(content.strip()) < 30:
+                            continue
+                        p = self._make_prompt(item, vendor, content)
+                        prompts.append(p)
+                        if progress_cb and len(prompts) % 3 == 0:
+                            progress_cb(len(prompts), vendor,
+                                        item.get(u"name", u""))
+                    except Exception as fe:
+                        self.log(u"[CL4R1T4S] WARN {}/{}: {}".format(
+                            vendor, item.get(u"name", u"?"), _u(fe)))
+                        time.sleep(0.5)   # back off a little on error
+
+                # One level of subdirectories
+                for subdir in subdirs:
+                    if stop_flag and stop_flag[0]:
+                        break
+                    try:
+                        sub_url  = subdir.get(u"url", u"")
+                        if not sub_url:
+                            continue
+                        sub_files, _ = self._list_dir(sub_url)
+                        sub_label    = u"{}/{}".format(vendor,
+                                           subdir.get(u"name", u""))
+                        for item in sub_files:
+                            if stop_flag and stop_flag[0]:
+                                break
+                            dl_url = item.get(u"download_url", u"")
+                            if not dl_url:
+                                continue
+                            try:
+                                content = self._download(dl_url)
+                                time.sleep(0.15)   # be polite to GitHub API
+                                if len(content.strip()) < 30:
+                                    continue
+                                p = self._make_prompt(item, sub_label, content)
+                                prompts.append(p)
+                                if progress_cb and len(prompts) % 3 == 0:
+                                    progress_cb(len(prompts), sub_label,
+                                                item.get(u"name", u""))
+                            except Exception as fe2:
+                                self.log(u"[CL4R1T4S] WARN {}/{}: {}".format(
+                                    sub_label, item.get(u"name", u"?"),
+                                    _u(fe2)))
+                                time.sleep(0.5)   # back off on error
+                    except Exception as sde:
+                        self.log(u"[CL4R1T4S] subdir err {}: {}".format(
+                            subdir.get(u"name", u"?"), _u(sde)))
+
+            except Exception as ve:
+                self.log(u"[CL4R1T4S] ERROR {}: {}".format(vendor, _u(ve)))
+
+        self.log(u"[CL4R1T4S] Fetch complete — {} system prompts".format(
+            len(prompts)))
+        return prompts
 
 
 # ---- Diff Engine ---------------------------------------------------------------
@@ -555,11 +811,14 @@ class ScanEngine(object):
         self._lock     = threading.Lock()
 
     def log(self, msg):
-        ts   = time.strftime(u"%H:%M:%S")
-        full = u"[{}] {}".format(ts, msg)
-        if self.on_log:
-            self.on_log(full)
-        self.callbacks.printOutput(full)
+        try:
+            ts   = time.strftime(u"%H:%M:%S")
+            full = u"[{}] {}".format(ts, _u(msg))
+            if self.on_log:
+                self.on_log(full)
+            self.callbacks.printOutput(full)
+        except Exception:
+            pass
 
     # =========================================================================
     # Text helpers
@@ -573,7 +832,7 @@ class ScanEngine(object):
                 return text.decode(enc)
             except Exception:
                 pass
-        return text.decode(u"ascii", u"replace")
+        return text.decode(u"latin-1", u"replace")
 
     # =========================================================================
     # Marker helpers
@@ -794,7 +1053,7 @@ class ScanEngine(object):
                             results.append((u"urlenc:{}".format(dec_key),
                                             u"&".join(new_parts)))
             except Exception as ex:
-                self.log(u"  [multipart-urlencode] " + str(ex))
+                self.log(u"  [multipart-urlencode] " + _u(ex))
 
         elif is_multi is True:
             # multipart: inject into text/plain parts
@@ -829,7 +1088,7 @@ class ScanEngine(object):
                     results.append((u"multipart:{}".format(field_name),
                                     delim.join(new_parts)))
             except Exception as ex:
-                self.log(u"  [multipart-parse] " + str(ex))
+                self.log(u"  [multipart-parse] " + _u(ex))
 
         return results
 
@@ -861,7 +1120,7 @@ class ScanEngine(object):
                 new_req     = helpers.buildHttpMessage(new_hdrs, body_bytes)
                 results.append((u"header:{}".format(hdr), new_req))
             except Exception as ex:
-                self.log(u"  [header-inject] {}: {}".format(hdr, str(ex)))
+                self.log(u"  [header-inject] {}: {}".format(hdr, _u(ex)))
         return results
 
     # =========================================================================
@@ -1069,7 +1328,7 @@ class ScanEngine(object):
             self.log(u"  [Issue] Auto-created {} issue: {}".format(
                 severity, prompt.name))
         except Exception:
-            self.log(u"  [Issue] Creation failed: " + traceback.format_exc())
+            self.log(u"  [Issue] Creation failed: " + _u(traceback.format_exc()))
 
     # =========================================================================
     # Main scan
@@ -1205,7 +1464,7 @@ class ScanEngine(object):
                             repeat_count, results, results_lock,
                             collab_ctx, collab_id)
                     except Exception:
-                        self.log(u"  ERR: " + traceback.format_exc())
+                        self.log(u"  ERR: " + _u(traceback.format_exc()))
                     if rep < repeat_count - 1 and delay_ms > 0:
                         time.sleep(delay_ms / 1000.0)
 
@@ -1223,7 +1482,7 @@ class ScanEngine(object):
                         results, results_lock,
                         collab_ctx, collab_id)
                 except Exception:
-                    self.log(u"  ERR: " + traceback.format_exc())
+                    self.log(u"  ERR: " + _u(traceback.format_exc()))
 
             if delay_ms > 0:
                 time.sleep(delay_ms / 1000.0)
@@ -1249,7 +1508,7 @@ class ScanEngine(object):
                     except Q.Empty:
                         break
                     except Exception:
-                        self.log(u"  WORKER ERR: " + traceback.format_exc())
+                        self.log(u"  WORKER ERR: " + _u(traceback.format_exc()))
 
             threads = []
             for _ in range(num_workers):
@@ -1365,7 +1624,14 @@ class ScanEngine(object):
 
 def _edt(fn):
     class _R(Runnable):
-        def run(self): fn()
+        def run(self):
+            try:
+                fn()
+            except Exception:
+                import traceback as _tb
+                import sys as _sys
+                _sys.stderr.write(u"[LLM Injector EDT] " +
+                                  _tb.format_exc() + u"\n")
     SwingUtilities.invokeLater(_R())
 
 
@@ -1459,7 +1725,11 @@ class PromptsTab(JPanel):
         toolbar.setBackground(C_PANEL)
         toolbar.setBorder(BorderFactory.createMatteBorder(0, 0, 1, 0, C_BORDER))
 
-        self.btn_fetch   = dark_button(u"  Fetch GitHub",    C_ACCENT,              Color.BLACK)
+        self.btn_fetch        = dark_button(u"  Fetch GitHub",     C_ACCENT,              Color.BLACK)
+        self.btn_fetch_cl4r1t = dark_button(u"  Fetch CL4R1T4S",  Color(80, 160, 220),   Color.BLACK)
+        self.btn_fetch_cl4r1t.setToolTipText(
+            u"Fetch leaked system prompts from elder-plinius/CL4R1T4S\n"
+            u"(ChatGPT, Gemini, Grok, Claude, Cursor, Devin, Replit and more)")
         self.btn_upload  = dark_button(u"  Upload File")
         self.btn_delete  = dark_button(u"  Delete Selected", Color(140, 40, 40),    C_TEXT)
         self.btn_en_all  = dark_button(u"  Enable All")
@@ -1475,9 +1745,9 @@ class PromptsTab(JPanel):
         self.progress.setPreferredSize(Dimension(260, 22))
         self.progress.setBorder(BorderFactory.createLineBorder(C_BORDER, 1))
 
-        for w in [self.btn_fetch, self.btn_upload, self.btn_delete,
-                  self.btn_en_all, self.btn_dis_all, self.btn_clear,
-                  self.lbl_count, self.progress]:
+        for w in [self.btn_fetch, self.btn_fetch_cl4r1t, self.btn_upload,
+                  self.btn_delete, self.btn_en_all, self.btn_dis_all,
+                  self.btn_clear, self.lbl_count, self.progress]:
             toolbar.add(w)
         self.add(toolbar, BorderLayout.NORTH)
 
@@ -1511,8 +1781,14 @@ class PromptsTab(JPanel):
             BorderFactory.createEmptyBorder(2, 6, 2, 6)))
         name_row.add(self.f_name)
 
-        cat_opts = [u"manual", u"jailbreak", u"leak", u"super", u"ultra", u"security"]
-        self.combo_cat = JComboBox(cat_opts)
+        cat_opts = [u"manual", u"jailbreak", u"leak", u"super", u"ultra",
+                    u"security", u"sysprompt"]
+        from javax.swing import DefaultComboBoxModel
+        from java.util import Vector as JVector
+        _cat_vec = JVector()
+        for _c in cat_opts:
+            _cat_vec.add(_c)
+        self.combo_cat = JComboBox(DefaultComboBoxModel(_cat_vec))
         self.combo_cat.setBackground(C_INPUT)
         self.combo_cat.setForeground(C_TEXT)
         self.combo_cat.setFont(Font(u"Monospaced", Font.PLAIN, 12))
@@ -1563,6 +1839,7 @@ class PromptsTab(JPanel):
             def actionPerformed(self, e): self.fn()
 
         self.btn_fetch.addActionListener(Act(self._on_fetch))
+        self.btn_fetch_cl4r1t.addActionListener(Act(self._on_fetch_cl4r1t4s))
         self.btn_upload.addActionListener(Act(self._on_upload))
         self.btn_delete.addActionListener(Act(self._on_delete_selected))
         self.btn_clear.addActionListener(Act(self._on_clear))
@@ -1619,18 +1896,119 @@ class PromptsTab(JPanel):
         self.set_progress(0, u"Fetching…")
 
         def _run():
-            def _prog(n, folder, fname):
+            try:
+                last_update = [0.0]
+                def _prog(n, folder, fname):
+                    now = time.time()
+                    if now - last_update[0] >= 0.8:
+                        last_update[0] = now
+                        self.set_progress(
+                            min(99, n % 100),
+                            u"{} – {}".format(folder, fname[:30]))
+                new_prompts = fetcher.fetch_all_prompts(
+                    progress_cb=_prog, stop_flag=stop_f)
+                self.state.prompts.extend(new_prompts)
+                self.state.save_prompts()
+                self.refresh_table()
                 self.set_progress(
-                    min(99, n % 100),
-                    u"{} – {}".format(folder, fname[:30]))
-            new_prompts = fetcher.fetch_all_prompts(
-                progress_cb=_prog, stop_flag=stop_f)
-            self.state.prompts.extend(new_prompts)
-            self.state.save_prompts()
-            self.refresh_table()
-            self.set_progress(100, u"Fetched {} prompts".format(len(new_prompts)))
+                    100, u"Fetched {} prompts".format(len(new_prompts)))
+            except Exception:
+                self.state.log(
+                    u"[GitHub fetch] ERROR:\n" + _u(traceback.format_exc()))
+                self.set_progress(0, u"GitHub fetch failed — see Output tab")
 
         threading.Thread(target=_run, name=u"LLM-Fetch").start()
+
+    def _on_fetch_cl4r1t4s(self):
+        """Fetch leaked system prompts from elder-plinius/CL4R1T4S."""
+        # Toggle: if already fetching, stop it
+        if getattr(self, u"_cl4r1t4s_stop", None) is not None:
+            self._cl4r1t4s_stop[0] = True
+            self.btn_fetch_cl4r1t.setText(u"  Fetch CL4R1T4S")
+            self.btn_fetch_cl4r1t.setBackground(Color(80, 160, 220))
+            self._cl4r1t4s_stop = None
+            self.set_progress(0, u"Fetch stopped.")
+            return
+
+        token   = self.state.config.get(u"github_token", u"")
+        stop_f  = [False]
+        self._cl4r1t4s_stop = stop_f
+        fetcher = CL4R1TASFetcher(token=token, log_fn=self.state.log)
+        self.set_progress(0, u"Fetching CL4R1T4S…")
+        self.btn_fetch_cl4r1t.setText(u"  Stop CL4R1T4S")
+        self.btn_fetch_cl4r1t.setBackground(Color(160, 60, 60))
+
+        def _run():
+            try:
+                last_update = [0.0]
+                def _prog(n, vendor, fname):
+                    now = time.time()
+                    if now - last_update[0] >= 0.8:
+                        last_update[0] = now
+                        self.set_progress(
+                            min(99, n % 100),
+                            u"CL4R1T4S ({} fetched): {} – {}".format(
+                                n, vendor, _u(fname)[:22]))
+
+                self.state.log(u"[CL4R1T4S] Starting fetch…")
+                new_prompts = fetcher.fetch_all_prompts(
+                    progress_cb=_prog, stop_flag=stop_f)
+                self.state.log(
+                    u"[CL4R1T4S] Fetch done: {} prompts retrieved".format(
+                        len(new_prompts)))
+
+                # Deduplicate — use _safe_hash so Java Strings never crash
+                self.state.log(u"[CL4R1T4S] Deduplicating…")
+                existing_hashes = set(
+                    _safe_hash(_u(p.name) + _u(p.content))
+                    for p in self.state.prompts)
+                added = []
+                for p in new_prompts:
+                    h = _safe_hash(_u(p.name) + _u(p.content))
+                    if h not in existing_hashes:
+                        existing_hashes.add(h)
+                        added.append(p)
+                self.state.log(
+                    u"[CL4R1T4S] {} new, {} duplicates skipped".format(
+                        len(added), len(new_prompts) - len(added)))
+
+                self.state.prompts.extend(added)
+
+                self.state.log(u"[CL4R1T4S] Saving…")
+                self.state.save_prompts()
+
+                self.state.log(u"[CL4R1T4S] Refreshing table…")
+                self.refresh_table()
+
+                self._cl4r1t4s_stop = None
+                def _done():
+                    try:
+                        self.btn_fetch_cl4r1t.setText(u"  Fetch CL4R1T4S")
+                        self.btn_fetch_cl4r1t.setBackground(Color(80, 160, 220))
+                    except Exception:
+                        pass
+                _edt(_done)
+                self.set_progress(
+                    100,
+                    u"CL4R1T4S: {} added, {} skipped".format(
+                        len(added), len(new_prompts) - len(added)))
+                self.state.log(
+                    u"[CL4R1T4S] Complete — {} prompts added.".format(len(added)))
+
+            except Exception:
+                err = _u(traceback.format_exc())
+                self.state.log(u"[CL4R1T4S] _run ERROR:\n" + err)
+                self._cl4r1t4s_stop = None
+                def _err_done():
+                    try:
+                        self.btn_fetch_cl4r1t.setText(u"  Fetch CL4R1T4S")
+                        self.btn_fetch_cl4r1t.setBackground(Color(80, 160, 220))
+                        self.set_progress(0, u"CL4R1T4S fetch failed — see Output tab")
+                    except Exception:
+                        pass
+                _edt(_err_done)
+
+        threading.Thread(target=_run, name=u"LLM-CL4R1T4S-Fetch").start()
 
     def _on_upload(self):
         fc = JFileChooser()
@@ -1653,7 +2031,7 @@ class PromptsTab(JPanel):
                 try:
                     content = raw.encode(u"utf-8").decode(u"utf-8")
                 except Exception:
-                    content = raw.encode(u"ascii", u"replace").decode(u"ascii")
+                    content = raw.encode(u"latin-1", u"replace").decode(u"latin-1")
                 name  = str(f.getName()).replace(u".md", u"").replace(u".txt", u"")
                 parts = [t.strip() for t in content.split(u"---") if len(t.strip()) > 20]
                 if not parts:
@@ -1666,7 +2044,7 @@ class PromptsTab(JPanel):
                         source=u"upload/" + str(f.getName())))
                     added += 1
             except Exception as e:
-                self.state.log(u"Upload error {}: {}".format(str(f.getName()), str(e)))
+                self.state.log(u"Upload error {}: {}".format(str(f.getName()), _u(e)))
         self.state.save_prompts()
         self.refresh_table()
         self.set_progress(100, u"{} prompts imported".format(added))
@@ -1785,14 +2163,18 @@ class ScannerTab(JPanel):
 
         cat_panel = section_panel(u"Prompt Categories")
         cat_panel.setLayout(BoxLayout(cat_panel, BoxLayout.Y_AXIS))
-        self.chk_jailb = JCheckBox(u"Jailbreaks",   True)
-        self.chk_leak  = JCheckBox(u"Leaks",         True)
-        self.chk_super = JCheckBox(u"Super Prompts", True)
-        self.chk_ultra = JCheckBox(u"Ultra Prompts", True)
-        self.chk_sec   = JCheckBox(u"Security",      False)
-        self.chk_all   = JCheckBox(u"Force-scan all endpoints")
+        self.chk_jailb    = JCheckBox(u"Jailbreaks",          True)
+        self.chk_leak     = JCheckBox(u"Leaks",               True)
+        self.chk_super    = JCheckBox(u"Super Prompts",       True)
+        self.chk_ultra    = JCheckBox(u"Ultra Prompts",       True)
+        self.chk_sec      = JCheckBox(u"Security",            False)
+        self.chk_sysprompt= JCheckBox(u"System Prompts (CL4R1T4S)", False)
+        self.chk_sysprompt.setToolTipText(
+            u"Include leaked system prompts from elder-plinius/CL4R1T4S\n"
+            u"(ChatGPT, Gemini, Grok, Claude, Cursor, Devin, Replit…)")
+        self.chk_all      = JCheckBox(u"Force-scan all endpoints")
         for w in [self.chk_jailb, self.chk_leak, self.chk_super,
-                  self.chk_ultra, self.chk_sec,
+                  self.chk_ultra, self.chk_sec, self.chk_sysprompt,
                   dark_label(u"  ________________________", color=C_BORDER),
                   self.chk_all]:
             w.setBackground(C_PANEL)
@@ -1858,7 +2240,7 @@ class ScannerTab(JPanel):
             rep_panel.add(dark_label(unit, bold=True), gbc)
 
         opt_outer.add(rep_panel)
-        opt_outer.add(Box.createVerticalGlue())
+        opt_outer.add(Box.createVerticalStrut(12))
         top_split.setRightComponent(scroll(opt_outer))
 
         ctrl = JPanel(FlowLayout(FlowLayout.LEFT, 8, 8))
@@ -1966,12 +2348,13 @@ class ScannerTab(JPanel):
             edited_req_bytes = self.state.pending_request
 
         cats = set()
-        if self.chk_jailb.isSelected(): cats.add(u"jailbreak")
-        if self.chk_leak.isSelected():  cats.add(u"leak")
-        if self.chk_super.isSelected(): cats.add(u"super")
-        if self.chk_ultra.isSelected(): cats.add(u"ultra")
-        if self.chk_sec.isSelected():   cats.add(u"security")
-        if self.chk_all.isSelected():   cats.add(u"manual")
+        if self.chk_jailb.isSelected():     cats.add(u"jailbreak")
+        if self.chk_leak.isSelected():      cats.add(u"leak")
+        if self.chk_super.isSelected():     cats.add(u"super")
+        if self.chk_ultra.isSelected():     cats.add(u"ultra")
+        if self.chk_sec.isSelected():       cats.add(u"security")
+        if self.chk_sysprompt.isSelected(): cats.add(u"sysprompt")
+        if self.chk_all.isSelected():       cats.add(u"manual")
         prompts = [p for p in self.state.prompts if p.category in cats or not cats]
         if not prompts:
             JOptionPane.showMessageDialog(
@@ -2282,7 +2665,7 @@ class ResultsTab(JPanel):
             self.state.log(u"[Repeater] Sent: " + r.url)
         except Exception as ex:
             JOptionPane.showMessageDialog(self,
-                u"Send to Repeater failed:\n" + str(ex),
+                u"Send to Repeater failed:\n" + _u(ex),
                 u"Error", JOptionPane.ERROR_MESSAGE)
 
     # =========================================================================
@@ -2308,7 +2691,7 @@ class ResultsTab(JPanel):
             self.state.log(u"[Intruder] Sent: " + r.url)
         except Exception as ex:
             JOptionPane.showMessageDialog(self,
-                u"Send to Intruder failed:\n" + str(ex),
+                u"Send to Intruder failed:\n" + _u(ex),
                 u"Error", JOptionPane.ERROR_MESSAGE)
 
     # =========================================================================
@@ -2377,7 +2760,7 @@ class ResultsTab(JPanel):
                 JOptionPane.INFORMATION_MESSAGE)
         except Exception as ex:
             JOptionPane.showMessageDialog(self,
-                u"Issue creation failed:\n" + str(ex),
+                u"Issue creation failed:\n" + _u(ex),
                 u"Error", JOptionPane.ERROR_MESSAGE)
 
     # =========================================================================
@@ -2459,7 +2842,7 @@ class ResultsTab(JPanel):
                 u"Export OK", JOptionPane.INFORMATION_MESSAGE)
         except Exception as ex:
             JOptionPane.showMessageDialog(self,
-                u"Export failed: " + str(ex), u"Error", JOptionPane.ERROR_MESSAGE)
+                u"Export failed: " + _u(ex), u"Error", JOptionPane.ERROR_MESSAGE)
 
     # =========================================================================
     # HTML report export
@@ -2483,7 +2866,7 @@ class ResultsTab(JPanel):
                 u"Report Saved", JOptionPane.INFORMATION_MESSAGE)
         except Exception as ex:
             JOptionPane.showMessageDialog(self,
-                u"Report failed: " + str(ex), u"Error", JOptionPane.ERROR_MESSAGE)
+                u"Report failed: " + _u(ex), u"Error", JOptionPane.ERROR_MESSAGE)
 
 
 # ---- History Tab ---------------------------------------------------------------
@@ -2804,7 +3187,10 @@ class ExtensionState(object):
         }
 
     def log(self, msg):
-        self.callbacks.printOutput(u"[LLM-Injector] " + str(msg))
+        try:
+            self.callbacks.printOutput(u"[LLM-Injector] " + _u(msg))
+        except Exception:
+            pass  # last-resort: never let logging crash the caller
 
     # -- Prompt stat tracking --------------------------------------------------
 
@@ -2829,46 +3215,66 @@ class ExtensionState(object):
     def load_settings(self):
         try:
             raw = self.callbacks.loadExtensionSetting(u"llm_config_v4")
-            if raw:
-                self.config.update(json.loads(raw))
-        except Exception:
-            pass
+            if not raw:
+                return
+            if not isinstance(raw, unicode):
+                raw = unicode(raw)
+            self.config.update(json.loads(raw))
+        except Exception as e:
+            self.log(u"load_settings error: " + _u(e))
 
     # -- Prompt persistence ----------------------------------------------------
 
     def save_prompts(self):
         try:
             data = [{
-                u"name":     p.name,
-                u"content":  p.content,
-                u"category": p.category,
-                u"source":   p.source,
-                u"enabled":  p.enabled,
+                u"name":     _u(p.name),
+                u"content":  _u(p.content),
+                u"category": _u(p.category),
+                u"source":   _u(p.source),
+                u"enabled":  bool(p.enabled),
             } for p in self.prompts]
-            self.callbacks.saveExtensionSetting(
-                u"llm_prompts_v2", json.dumps(data, ensure_ascii=False))
+            raw = json.dumps(data, ensure_ascii=False)
+            if not isinstance(raw, unicode):
+                raw = unicode(raw)
+            self.callbacks.saveExtensionSetting(u"llm_prompts_v2", raw)
+            self.log(u"Saved {} prompts.".format(len(self.prompts)))
         except Exception as e:
-            self.log(u"save_prompts error: " + str(e))
+            self.log(u"save_prompts error: " + _u(e) +
+                     u"\n" + _u(traceback.format_exc()))
 
     def load_prompts(self):
         try:
             raw = self.callbacks.loadExtensionSetting(u"llm_prompts_v2")
+            # Migrate: try old v1 key if v2 is empty
             if not raw:
+                raw = self.callbacks.loadExtensionSetting(u"llm_prompts")
+            if not raw:
+                self.log(u"No saved prompts found (first run or cleared).")
                 return
+            # raw may be a Java String — coerce to Python unicode
+            if not isinstance(raw, unicode):
+                raw = unicode(raw)
             loaded = []
             for d in json.loads(raw):
-                p         = Prompt(
-                    name     = d.get(u"name",     u"unknown"),
-                    content  = d.get(u"content",  u""),
-                    category = d.get(u"category", u"manual"),
-                    source   = d.get(u"source",   u"saved"),
+                # Coerce all string fields to unicode safely
+                def _s(v, default=u""):
+                    if v is None: return default
+                    return v if isinstance(v, unicode) else unicode(v)
+                p = Prompt(
+                    name     = _s(d.get(u"name"),     u"unknown"),
+                    content  = _s(d.get(u"content"),  u""),
+                    category = _s(d.get(u"category"), u"manual"),
+                    source   = _s(d.get(u"source"),   u"saved"),
                 )
-                p.enabled = d.get(u"enabled", True)
-                loaded.append(p)
+                p.enabled = bool(d.get(u"enabled", True))
+                if p.content:   # skip empty-content entries
+                    loaded.append(p)
             self.prompts = loaded
             self.log(u"Loaded {} prompts from storage.".format(len(loaded)))
         except Exception as e:
-            self.log(u"load_prompts error: " + str(e))
+            self.log(u"load_prompts error: " + _u(e) +
+                     u"\n" + _u(traceback.format_exc()))
 
     # -- History persistence ---------------------------------------------------
 
@@ -2892,16 +3298,22 @@ class ExtensionState(object):
             raw = self.callbacks.loadExtensionSetting(u"llm_history_v1")
             if not raw:
                 return
+            if not isinstance(raw, unicode):
+                raw = unicode(raw)
             for name, d in json.loads(raw).items():
+                if not isinstance(name, unicode):
+                    name = unicode(name)
                 stat             = PromptStat(name)
-                stat.match_count = d.get(u"match_count", 0)
-                stat.test_count  = d.get(u"test_count",  0)
+                stat.match_count = int(d.get(u"match_count", 0))
+                stat.test_count  = int(d.get(u"test_count",  0))
                 stat.last_seen   = d.get(u"last_seen",   u"")
+                if not isinstance(stat.last_seen, unicode):
+                    stat.last_seen = unicode(stat.last_seen)
                 self.prompt_history[name] = stat
             self.log(u"Loaded history for {} prompts.".format(
                 len(self.prompt_history)))
         except Exception as e:
-            self.log(u"load_history error: " + str(e))
+            self.log(u"load_history error: " + _u(e))
 
 
 # ---- LLM Injection Issue -------------------------------------------------------
@@ -3035,7 +3447,7 @@ class BurpExtender(IBurpExtender, ITab, IExtensionStateListener):
                             if hasattr(parent, u"setSelectedIndex"):
                                 parent.setSelectedIndex(1)
                         except Exception:
-                            self_.state.log(u"Send error:\n" + traceback.format_exc())
+                            self_.state.log(u"Send error:\n" + _u(traceback.format_exc()))
 
                     class _Act(ActionListener):
                         def actionPerformed(self_a, e): _send()
@@ -3046,7 +3458,7 @@ class BurpExtender(IBurpExtender, ITab, IExtensionStateListener):
                     items.add(mi)
                     return items
                 except Exception:
-                    callbacks.printOutput(u"CMF error:\n" + traceback.format_exc())
+                    callbacks.printOutput(u"CMF error:\n" + _u(traceback.format_exc()))
                     from java.util import ArrayList as AL2
                     return AL2()
 
@@ -3054,68 +3466,140 @@ class BurpExtender(IBurpExtender, ITab, IExtensionStateListener):
         callbacks.registerScannerCheck(PassiveScanner(self._state))
         callbacks.registerExtensionStateListener(BurpExtender.this_ref)
 
+        # ----------------------------------------------------------------
+        # IMPORTANT: initialise _main_panel synchronously RIGHT NOW so
+        # that getUiComponent() never throws even if the EDT build is
+        # delayed or fails.  addSuiteTab() is also called synchronously so
+        # Burp registers the tab immediately.
+        # ----------------------------------------------------------------
+        self._main_panel = JPanel(BorderLayout())
+        self._main_panel.setBackground(C_BG)
+        # Register the tab now — Burp will call getUiComponent() and
+        # getTabCaption() immediately; both are safe at this point.
+        callbacks.addSuiteTab(BurpExtender.this_ref)
+        callbacks.printOutput(u"{} v{} registering tab…".format(
+            EXT_NAME, EXT_VERSION))
+
         def _build_ui():
-            self._tabs = JTabbedPane()
-            self._tabs.setBackground(C_BG)
-            self._tabs.setForeground(C_TEXT)
-            self._tabs.setFont(Font(u"Dialog", Font.BOLD, 13))
+            try:
+                tabs = JTabbedPane()
+                tabs.setBackground(C_BG)
+                tabs.setForeground(C_TEXT)
+                tabs.setFont(Font(u"Dialog", Font.BOLD, 13))
 
-            self._prompts_tab = PromptsTab(self._state)
-            self._scanner_tab = ScannerTab(self._state)
-            self._results_tab = ResultsTab(self._state)
-            self._history_tab = HistoryTab(self._state)
-            self._config_tab  = ConfigTab(self._state)
+                # Build each tab individually — if one fails the others still load
+                def _safe_tab(name, factory):
+                    try:
+                        return factory()
+                    except Exception:
+                        err_msg = u"[{}] failed to load:\n\n{}".format(
+                            name, _u(traceback.format_exc()))
+                        callbacks.printOutput(u"[LLM Injector] " + err_msg)
+                        ep = JPanel(BorderLayout())
+                        ep.setBackground(C_BG)
+                        ta = JTextArea(err_msg)
+                        ta.setBackground(C_BG)
+                        ta.setForeground(Color(220, 80, 80))
+                        ta.setFont(Font(u"Monospaced", Font.PLAIN, 11))
+                        ta.setEditable(False)
+                        sp = JScrollPane(ta)
+                        sp.setBorder(None)
+                        ep.add(sp, BorderLayout.CENTER)
+                        return ep
 
-            self._scanner_tab_ref[0]     = self._scanner_tab
-            self._state.results_tab      = self._results_tab
-            self._state.history_tab      = self._history_tab
+                prompts_tab = _safe_tab(u"Prompts",  lambda: PromptsTab(self._state))
+                scanner_tab = _safe_tab(u"Scanner",  lambda: ScannerTab(self._state))
+                results_tab = _safe_tab(u"Results",  lambda: ResultsTab(self._state))
+                history_tab = _safe_tab(u"History",  lambda: HistoryTab(self._state))
+                config_tab  = _safe_tab(u"Config",   lambda: ConfigTab(self._state))
 
-            tab_data = [
-                (u"  \U0001f4ac Prompts",  self._prompts_tab, C_ACCENT),
-                (u"  \U0001f50d Scanner",  self._scanner_tab, Color(100, 180, 255)),
-                (u"  \U0001f4cb Results",  self._results_tab, Color(255, 160, 80)),
-                (u"  \U0001f4ca History",  self._history_tab, Color(200, 120, 255)),
-                (u"  \u2699 Config",       self._config_tab,  Color(200, 150, 255)),
-            ]
-            for title, panel, color in tab_data:
-                self._tabs.addTab(title, panel)
-            for i, (_, _, color) in enumerate(tab_data):
-                self._tabs.setForegroundAt(i, color)
+                # Store refs only if they are the real classes (not error panels)
+                if isinstance(prompts_tab, PromptsTab):
+                    self._prompts_tab = prompts_tab
+                if isinstance(scanner_tab, ScannerTab):
+                    self._scanner_tab = scanner_tab
+                    self._scanner_tab_ref[0] = scanner_tab
+                if isinstance(results_tab, ResultsTab):
+                    self._results_tab = results_tab
+                    self._state.results_tab = results_tab
+                if isinstance(history_tab, HistoryTab):
+                    self._history_tab = history_tab
+                    self._state.history_tab = history_tab
+                if isinstance(config_tab, ConfigTab):
+                    self._config_tab = config_tab
 
-            # Credits footer
-            credit_bar = JPanel(FlowLayout(FlowLayout.CENTER, 6, 4))
-            credit_bar.setBackground(Color(18, 20, 26))
-            credit_bar.setBorder(BorderFactory.createMatteBorder(1, 0, 0, 0, C_BORDER))
+                # Plain ASCII tab titles — BMP only (Jython 2.7 safe)
+                tab_data = [
+                    (u"  [P] Prompts",  prompts_tab, C_ACCENT),
+                    (u"  [S] Scanner",  scanner_tab, Color(100, 180, 255)),
+                    (u"  [R] Results",  results_tab, Color(255, 160, 80)),
+                    (u"  [H] History",  history_tab, Color(200, 120, 255)),
+                    (u"  [C] Config",   config_tab,  Color(200, 150, 255)),
+                ]
+                for title, panel, color in tab_data:
+                    tabs.addTab(title, panel)
+                for i, (_, _, color) in enumerate(tab_data):
+                    tabs.setForegroundAt(i, color)
 
-            for txt, color, bold in [
-                (u"Coded with", C_MUTED, False),
-                (u"\u2764", Color(220, 60, 60), True),
-                (u"  Anmol K Sachan  (@FR13ND0x7f)", C_ACCENT, True),
-                (u"  |  {} v{}".format(EXT_NAME, EXT_VERSION), C_MUTED, False),
-                (u"  |  " + REPO_URL, Color(80, 140, 220), False),
-            ]:
-                lbl = JLabel(txt)
-                lbl.setForeground(color)
-                lbl.setFont(Font(u"Dialog", Font.BOLD if bold else Font.PLAIN, 11))
-                credit_bar.add(lbl)
+                # Credits footer
+                credit_bar = JPanel(FlowLayout(FlowLayout.CENTER, 6, 4))
+                credit_bar.setBackground(Color(18, 20, 26))
+                credit_bar.setBorder(
+                    BorderFactory.createMatteBorder(1, 0, 0, 0, C_BORDER))
+                for txt, color, bold in [
+                    (u"Coded with <3 by", C_MUTED, False),
+                    (u"  Anmol K Sachan (@FR13ND0x7f)", C_ACCENT, True),
+                    (u"  |  {} v{}".format(EXT_NAME, EXT_VERSION), C_MUTED, False),
+                    (u"  |  " + REPO_URL,      Color(80, 140, 220), False),
+                    (u"  |  " + CL4R1TAS_URL,  Color(80, 160, 220), False),
+                ]:
+                    lbl = JLabel(txt)
+                    lbl.setForeground(color)
+                    lbl.setFont(Font(u"Dialog",
+                                    Font.BOLD if bold else Font.PLAIN, 11))
+                    credit_bar.add(lbl)
 
-            self._main_panel = JPanel(BorderLayout())
-            self._main_panel.setBackground(C_BG)
-            self._main_panel.add(self._tabs, BorderLayout.CENTER)
-            self._main_panel.add(credit_bar, BorderLayout.SOUTH)
+                # Populate the already-registered panel in-place
+                self._main_panel.add(tabs, BorderLayout.CENTER)
+                self._main_panel.add(credit_bar, BorderLayout.SOUTH)
+                self._main_panel.revalidate()
+                self._main_panel.repaint()
 
-            callbacks.addSuiteTab(BurpExtender.this_ref)
-            callbacks.printOutput(u"{} v{} loaded OK.".format(EXT_NAME, EXT_VERSION))
-            self._prompts_tab.refresh_table()
+                callbacks.printOutput(
+                    u"{} v{} UI loaded OK.".format(EXT_NAME, EXT_VERSION))
+
+                if hasattr(self, u"_prompts_tab"):
+                    self._prompts_tab.refresh_table()
+
+            except Exception:
+                err = _u(traceback.format_exc())
+                callbacks.printOutput(u"[LLM Injector] _build_ui ERROR:\n" + err)
+                # Show the error inside the blank panel so it's immediately visible
+                try:
+                    ta = JTextArea(
+                        u"LLM Injector failed to build UI.\n\n"
+                        u"Error (also in Extender > Output tab):\n\n" + err)
+                    ta.setBackground(Color(20, 10, 10))
+                    ta.setForeground(Color(220, 80, 80))
+                    ta.setFont(Font(u"Monospaced", Font.PLAIN, 11))
+                    ta.setEditable(False)
+                    sp = JScrollPane(ta)
+                    self._main_panel.add(sp, BorderLayout.CENTER)
+                    self._main_panel.revalidate()
+                    self._main_panel.repaint()
+                except Exception:
+                    pass
 
         class _R(Runnable):
             def run(self): _build_ui()
         SwingUtilities.invokeLater(_R())
 
     def getTabCaption(self):
-        return u"LLM Injector"
+        # Plain str — Jython 2.7 unicode prefix fine but plain str is safer
+        return "LLM Injector"
 
     def getUiComponent(self):
+        # Always safe — _main_panel initialised synchronously above
         return self._main_panel
 
     def extensionUnloaded(self):
